@@ -8,6 +8,25 @@ ARGO_TOKEN=""
 # 单端口模式 UDP 协议选择: hy2 (默认) 或 tuic
 SINGLE_PORT_UDP="hy2"
 
+# 自定义域名和证书 (可选)
+# 如果填写了 CUSTOM_CERT 和 CUSTOM_KEY，将使用自定义证书
+# 否则将使用 CUSTOM_DOMAIN (默认 www.bing.com) 和自动生成的自签名证书
+CUSTOM_DOMAIN="" 
+CUSTOM_CERT=""
+CUSTOM_KEY=""
+
+# ================== ACME (Cloudflare) 自动证书配置 ==================
+# 方式 1 (推荐): 使用 API Token (更安全)
+# 获取: Cloudflare 后台 -> My Profile -> API Tokens -> Create Token -> 模板选择 "Edit zone DNS"
+# Account ID 在域名概览页右侧边栏下方可以找到
+CF_TOKEN=""
+CF_ACCOUNT_ID=""
+
+# 方式 2: 使用 Global API Key (旧方式，权限过大，不推荐)
+CF_EMAIL=""
+CF_KEY=""
+
+
 # ================== CF 优选域名列表 ==================
 CF_DOMAINS=(
     "cf.090227.xyz"
@@ -114,16 +133,75 @@ fi
 
 # ================== 证书生成 ==================
 echo "[证书] 生成中..."
-# 优先使用 OpenSSL 生成标准证书
-if command -v openssl >/dev/null 2>&1; then
-    openssl req -x509 -newkey rsa:2048 -nodes -sha256 -keyout "${FILE_PATH}/private.key" -out "${FILE_PATH}/cert.pem" -days 3650 -subj "/CN=www.bing.com" >/dev/null 2>&1
-else
-    # 备用
-    printf -- "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIM4792SEtPqIt1ywqTd/0bYidBqpYV/+siNnfBYsdUYsoAoGCCqGSM49\nAwEHoUQDQgAE1kHafPj07rJG+HboH2ekAI4r+e6TL38GWASAnngZreoQDF16ARa/\nTsyLyFoPkhTxSbehH/OBEjHtSZGaDhMqQ==\n-----END EC PRIVATE KEY-----\n" > "${FILE_PATH}/private.key"
 
-    printf -- "-----BEGIN CERTIFICATE-----\nMIIBejCCASGgAwIBAgIUFWeQL3556PNJLp/veCFxGNj9crkwCgYIKoZIzj0EAwIw\nEzERMA8GA1UEAwwIYmluZy5jb20wHhcNMjUwMTAxMDEwMTAwWhcNMzUwMTAxMDEw\nMTAwWjATMREwDwYDVQQDDAhiaW5nLmNvbTBZMBMGByqGSM49AgEGCCqGSM49AwEH\nA0IABNZB2nz49O6yRvh26B9npACOK/nuky9/BlgEgJ54Ga3qEAxdegEWv07Mi8ha\nD5IU8Um3oR/zgRIx7UmRmg4TKkOjUzBRMB0GA1UdDgQWBBTV1cFID7UISE7PLTBR\nBfGbgrkMNzAfBgNVHSMEGDAWgBTV1cFID7UISE7PLTBRBfGbgrkMNzAPBgNVHRMB\nAf8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIARDAJvg0vd/ytrQVvEcSm6XTlB+\neQ6OFb9LbLYL9Zi+AiB+foMbi4y/0YUQlTtz7as9S8/lciBF5VCUoVIKS+vX2g==\n-----END CERTIFICATE-----\n" > "${FILE_PATH}/cert.pem"
+DOMAIN="${CUSTOM_DOMAIN:-www.bing.com}"
+USE_ACME=false
+
+# 检测 ACME 配置
+if [ -n "$CUSTOM_DOMAIN" ]; then
+    if [ -n "$CF_TOKEN" ] && [ -n "$CF_ACCOUNT_ID" ]; then
+        echo "[ACME] 检测到 Cloudflare API Token 配置..."
+        export CF_Token="$CF_TOKEN"
+        export CF_Account_ID="$CF_ACCOUNT_ID"
+        USE_ACME=true
+    elif [ -n "$CF_EMAIL" ] && [ -n "$CF_KEY" ]; then
+        echo "[ACME] 检测到 Cloudflare Global Key 配置..."
+        export CF_Key="$CF_KEY"
+        export CF_Email="$CF_EMAIL"
+        USE_ACME=true
+    fi
 fi
-echo "[证书] 已就绪"
+
+if [ "$USE_ACME" = true ]; then
+    echo "[ACME] 开始申请证书..."
+    
+    # 安装 acme.sh 到临时目录
+    ACME_HOME="${FILE_PATH}/acme.sh"
+    mkdir -p "$ACME_HOME"
+    
+    # 根据是否提供了 Email 决定注册方式 (Token 模式可以不需要 Email，但 acme.sh 注册账户最好有一个)
+    REG_EMAIL="${CF_EMAIL:-auto@${DOMAIN}}"
+    curl -s https://get.acme.sh | sh -s email="$REG_EMAIL" --install-home "$ACME_HOME" >/dev/null 2>&1
+    
+    # 申请证书
+    if "$ACME_HOME/acme.sh" --issue --dns dns_cf -d "$DOMAIN" --server zerossl; then
+        echo "[ACME] 证书申请成功"
+        
+        # 创建重载脚本 (因为 sing-box 还没启动，PID 未知，所以只能先写好脚本)
+        RELOAD_CMD="${FILE_PATH}/reload_sb.sh"
+        echo "#!/bin/bash" > "$RELOAD_CMD"
+        echo "[ -f \"${FILE_PATH}/sb.pid\" ] && kill -1 \$(cat \"${FILE_PATH}/sb.pid\") && echo \"[ACME] Sing-box 重载成功\"" >> "$RELOAD_CMD"
+        chmod +x "$RELOAD_CMD"
+
+        # 安装证书并配置重载钩子
+        "$ACME_HOME/acme.sh" --install-cert -d "$DOMAIN" \
+            --key-file       "${FILE_PATH}/private.key"  \
+            --fullchain-file "${FILE_PATH}/cert.pem" \
+            --reloadcmd      "$RELOAD_CMD"
+    else
+        echo "[ACME] 证书申请失败，请检查 Token/Key 或 域名配置。将回退到自签名证书。"
+    fi
+fi
+
+if [ -f "${FILE_PATH}/cert.pem" ] && [ -f "${FILE_PATH}/private.key" ]; then
+    echo "[证书] 使用现有证书 (ACME 或 自定义)"
+elif [ -n "$CUSTOM_CERT" ] && [ -n "$CUSTOM_KEY" ]; then
+    echo "[证书] 使用自定义证书字符串..."
+    echo "$CUSTOM_CERT" > "${FILE_PATH}/cert.pem"
+    echo "$CUSTOM_KEY" > "${FILE_PATH}/private.key"
+else
+    echo "[证书] 生成自签名证书..."
+    # 优先使用 OpenSSL 生成标准证书
+    if command -v openssl >/dev/null 2>&1; then
+        openssl req -x509 -newkey rsa:2048 -nodes -sha256 -keyout "${FILE_PATH}/private.key" -out "${FILE_PATH}/cert.pem" -days 3650 -subj "/CN=${DOMAIN}" >/dev/null 2>&1
+    else
+        # 备用
+        printf -- "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIM4792SEtPqIt1ywqTd/0bYidBqpYV/+siNnfBYsdUYsoAoGCCqGSM49\nAwEHoUQDQgAE1kHafPj07rJG+HboH2ekAI4r+e6TL38GWASAnngZreoQDF16ARa/\nTsyLyFoPkhTxSbehH/OBEjHtSZGaDhMqQ==\n-----END EC PRIVATE KEY-----\n" > "${FILE_PATH}/private.key"
+
+        printf -- "-----BEGIN CERTIFICATE-----\nMIIBejCCASGgAwIBAgIUFWeQL3556PNJLp/veCFxGNj9crkwCgYIKoZIzj0EAwIw\nEzERMA8GA1UEAwwIYmluZy5jb20wHhcNMjUwMTAxMDEwMTAwWhcNMzUwMTAxMDEw\nMTAwWjATMREwDwYDVQQDDAhiaW5nLmNvbTBZMBMGByqGSM49AgEGCCqGSM49AwEH\nA0IABNZB2nz49O6yRvh26B9npACOK/nuky9/BlgEgJ54Ga3qEAxdegEWv07Mi8ha\nD5IU8Um3oR/zgRIx7UmRmg4TKkOjUzBRMB0GA1UdDgQWBBTV1cFID7UISE7PLTBR\nBfGbgrkMNzAfBgNVHSMEGDAWgBTV1cFID7UISE7PLTBRBfGbgrkMNzAPBgNVHRMB\nAf8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIARDAJvg0vd/ytrQVvEcSm6XTlB+\neQ6OFb9LbLYL9Zi+AiB+foMbi4y/0YUQlTtz7as9S8/lciBF5VCUoVIKS+vX2g==\n-----END CERTIFICATE-----\n" > "${FILE_PATH}/cert.pem"
+    fi
+fi
+echo "[证书] 已就绪 (域名: ${DOMAIN})"
 
 # ================== ISP ==================
 ISP=$(curl -s --max-time 2 https://speed.cloudflare.com/meta 2>/dev/null | awk -F'"' '{print $26"-"$18}' | sed 's/-$//' || echo "Node")
@@ -135,10 +213,10 @@ generate_sub() {
     > "${FILE_PATH}/list.txt"
     
     # TUIC (UDP)
-    [ -n "$TUIC_PORT" ] && echo "tuic://${UUID}:admin@${PUBLIC_IP}:${TUIC_PORT}?sni=www.bing.com&alpn=h3&congestion_control=bbr&allowInsecure=1#TUIC-${ISP}" >> "${FILE_PATH}/list.txt"
+    [ -n "$TUIC_PORT" ] && echo "tuic://${UUID}:admin@${PUBLIC_IP}:${TUIC_PORT}?sni=${DOMAIN}&alpn=h3&congestion_control=bbr&allowInsecure=1#TUIC-${ISP}" >> "${FILE_PATH}/list.txt"
     
     # HY2 (UDP)
-    [ -n "$HY2_PORT" ] && echo "hysteria2://${UUID}@${PUBLIC_IP}:${HY2_PORT}/?sni=www.bing.com&insecure=1#Hysteria2-${ISP}" >> "${FILE_PATH}/list.txt"
+    [ -n "$HY2_PORT" ] && echo "hysteria2://${UUID}@${PUBLIC_IP}:${HY2_PORT}/?sni=${DOMAIN}&insecure=1#Hysteria2-${ISP}" >> "${FILE_PATH}/list.txt"
     
     # Reality (TCP)
     [ -n "$REALITY_PORT" ] && echo "vless://${UUID}@${PUBLIC_IP}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.nazhumi.com&fp=chrome&pbk=${public_key}&type=tcp#Reality-${ISP}" >> "${FILE_PATH}/list.txt"
@@ -258,6 +336,7 @@ echo "[CONFIG] 配置已生成"
 echo "[SING-BOX] 启动中..."
 "$SB_FILE" run -c "${FILE_PATH}/config.json" &
 SB_PID=$!
+echo "$SB_PID" > "${FILE_PATH}/sb.pid"
 sleep 2
 
 if ! kill -0 $SB_PID 2>/dev/null; then
@@ -267,6 +346,17 @@ if ! kill -0 $SB_PID 2>/dev/null; then
     exit 1
 fi
 echo "[SING-BOX] 已启动 PID: $SB_PID"
+
+# ================== [ACME] 启动自动续期守护进程 ==================
+if [ "$USE_ACME" = true ]; then
+    (
+        while true; do
+            sleep 86400 # 每天检查一次
+            "$ACME_HOME/acme.sh" --cron --home "$ACME_HOME" >/dev/null 2>&1
+        done
+    ) &
+    echo "[ACME] 自动续期守护进程已启动"
+fi
 
 # ================== [修复] Argo 隧道 ==================
 ARGO_LOG="${FILE_PATH}/argo.log"
