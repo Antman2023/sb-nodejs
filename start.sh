@@ -203,8 +203,18 @@ else
 fi
 echo "[证书] 已就绪 (域名: ${DOMAIN})"
 
-# ================== ISP ==================
-ISP=$(curl -s --max-time 2 https://speed.cloudflare.com/meta 2>/dev/null | awk -F'"' '{print $26"-"$18}' | sed 's/-$//' || echo "Node")
+# ===== ISP =====
+ISP="Node"
+if [ "$CURL_AVAILABLE" = true ]; then
+    JSON_DATA=$(curl -s --max-time 2 -H "Referer: https://speed.cloudflare.com/" https://speed.cloudflare.com/meta 2>/dev/null)
+    if [ -n "$JSON_DATA" ]; then
+        ORG=$(echo "$JSON_DATA" | sed -n 's/.*"asOrganization":"\([^"]*\)".*/\1/p')
+        CITY=$(echo "$JSON_DATA" | sed -n 's/.*"city":"\([^"]*\)".*/\1/p')
+        if [ -n "$ORG" ] && [ -n "$CITY" ]; then
+            ISP="${ORG}-${CITY}"
+        fi
+    fi
+fi
 [ -z "$ISP" ] && ISP="Node"
 
 # ================== 生成订阅 ==================
